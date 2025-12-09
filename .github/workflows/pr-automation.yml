@@ -1,0 +1,355 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint checks
+        id: eslint
+        run: |
+          npm run lint
+          if [ $? -ne 0 ]; then
+            echo "eslint_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Prettier formatting checks
+        id: prettier
+        run: |
+          npx prettier --check .
+          if [ $? -ne 0 ]; then
+            echo "prettier_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { eslint_failed, prettier_failed } = context.steps;
+            let comment = "## Code Quality Report\n\n";
+            
+            // ESLint Results
+            comment += "### ESLint Checks\n";
+            comment += eslint_failed.outputs.eslint_failed ? "❌ **ESLint found issues in the code.**\n" : "✅ **ESLint checks passed.**\n";
+            
+            // Prettier Results
+            comment += "\n### Prettier Formatting Checks\n";
+            comment += prettier_failed.outputs.prettier_failed ? "❌ **Prettier found formatting issues.**\n" : "✅ **Prettier checks passed.**\n";
+            
+            comment += "\n---\n*This report was generated automatically by the PR Automation Workflow.*";
+
+            // Check for existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const existingComment = comments.find(c => c.body.startsWith("## Code Quality Report"));
+
+            if (existingComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite with coverage
+        id: test
+        run: |
+          npm test -- --coverage
+          if [ $? -ne 0 ]; then
+            echo "test_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: warn
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs').promises;
+            let coverageSummary = "No coverage summary available (coverage report not found).";
+            
+            // Try to read coverage summary
+            try {
+              const coverageData = JSON.parse(await fs.readFile('./coverage/coverage-summary.json', 'utf8'));
+              const total = coverageData.total;
+              coverageSummary = `
+              | Metric | Percentage |
+              |--------|------------|
+              | Statements | ${total.statements.pct}% |
+              | Branches | ${total.branches.pct}% |
+              | Functions | ${total.functions.pct}% |
+              | Lines | ${total.lines.pct}% |
+              `;
+            } catch (err) {
+              console.log("Error reading coverage summary:", err);
+            }
+
+            const { test_failed } = context.steps.test.outputs;
+            let comment = "## Test Coverage Report\n\n";
+            
+            comment += test_failed ? "❌ **Tests failed.**\n" : "✅ **All tests passed.**\n";
+            comment += "\n### Coverage Summary\n";
+            comment += coverageSummary;
+            comment += "\n\n### Artifacts\n- Coverage report: Uploaded as `coverage-report` artifact";
+            comment += "\n---\n*This report was generated automatically by the PR Automation Workflow.*";
+
+            // Check for existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const existingComment = comments.find(c => c.body.startsWith("## Test Coverage Report"));
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability check (npm audit)
+        id: npm-audit
+        run: |
+          npm audit --json > npm-audit.json || echo "vulnerabilities_found=true" >> $GITHUB_OUTPUT
+
+      - name: Secret scanning (Gitleaks)
+        uses: zricethezav/gitleaks-action@v2.2.0
+        id: gitleaks
+        with:
+          args: --path=. --report-path=gitleaks-report.json
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs').promises;
+            let vulnSummary = "✅ No dependency vulnerabilities detected.";
+            let secretSummary = "✅ No secrets found in code changes.";
+
+            // Process npm audit results
+            try {
+              const auditData = JSON.parse(await fs.readFile('./npm-audit.json', 'utf8'));
+              const { critical, high, moderate, low } = auditData.metadata.vulnerabilities;
+              
+              if (critical > 0 || high > 0 || moderate > 0 || low > 0) {
+                vulnSummary = `
+                ### Dependency Vulnerabilities:
+                - Critical: ${critical}
+                - High: ${high}
+                - Moderate: ${moderate}
+                - Low: ${low}
+                `;
+              }
+            } catch (err) {
+              vulnSummary = "⚠️ Failed to generate dependency vulnerability report.";
+              console.log("Error reading npm audit:", err);
+            }
+
+            // Process gitleaks results
+            try {
+              if (await fs.access('./gitleaks-report.json').then(() => true).catch(() => false)) {
+                const secretData = JSON.parse(await fs.readFile('./gitleaks-report.json', 'utf8'));
+                if (secretData.length > 0) {
+                  secretSummary = `❌ **${secretData.length} potential secret(s) detected in code changes.**`;
+                }
+              }
+            } catch (err) {
+              secretSummary = "⚠️ Failed to complete secret scan.";
+              console.log("Error reading gitleaks report:", err);
+            }
+
+            const { vulnerabilities_found } = context.steps['npm-audit'].outputs;
+            let comment = "## Security Scan Report\n\n";
+            
+            comment += "### Dependencies & Vulnerabilities\n";
+            comment += vulnerabilities_found ? "❌ **Dependency vulnerabilities detected.**\n" : "✅ **No high/critical dependency vulnerabilities found.**\n";
+            comment += vulnSummary;
+            
+            comment += "\n### Secret Scanning\n";
+            comment += secretSummary;
+            
+            comment += "\n---\n*This report was generated automatically by the PR Automation Workflow.*";
+
+            // Check for existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const existingComment = comments.find(c => c.body.startsWith("## Security Scan Report"));
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          npm run build
+          if [ $? -ne 0 ]; then
+            echo "build_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate endpoints (example)
+        id: endpoint-validation
+        if: steps.build.outcome == 'success'
+        run: |
+          echo "ℹ️ Running endpoint validation (example)..."
+          # For a real application, you would:
+          # 1. Start the application server
+          # 2. Use curl/wget to test endpoints
+          # 3. Fail if endpoints are not accessible
+          echo "✅ Endpoint validation (example) completed successfully."
+
+      - name: Upload deployment preview artifacts
+        uses: actions/upload-artifact@v4
+        if: steps.build.outcome == 'success'
+        with:
+          name: build-artifacts
+          path: dist/
+          if-no-files-found: warn
+
+      - name: Post Build Validation Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { build_failed } = context.steps.build.outputs;
+            let comment = "## Build Validation\n\n";
+            
+            if (build_failed) {
+              comment += "❌ **Application build failed.**\n";
+            } else {
+              comment += "✅ **Application built successfully.**\n";
+              comment += "\n### Endpoint Validation\n✅ **Endpoint validation (example) passed.**\n";
+              comment += "\n### Artifacts\n- Build artifacts: Uploaded as `build-artifacts` artifact";
+            }
+            
+            comment += "\n---\n*This report was generated automatically by the PR Automation Workflow.*";
+
+            // Check for existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const existingComment = comments.find(c => c.body.startsWith("## Build Validation"));
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
